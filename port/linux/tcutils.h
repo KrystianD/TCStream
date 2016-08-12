@@ -3,9 +3,15 @@
 
 #include <stdint.h>
 #include <sys/time.h>
+#include <stdio.h>
+#include <cstdlib>
 
-// #define LOG(x,...) printf(x "\r\n", ##__VA_ARGS__)
-#define LOG_INFO(x,...) printf(x, ##__VA_ARGS__)
+#ifdef ANDROID_NDK
+#include <android/log.h>
+#define TCS_LOG_FUNC(x,...) __android_log_print(2, "tcstream", x , ##__VA_ARGS__)
+#else
+#define TCS_LOG_FUNC(x,...) fprintf(stderr, x, ##__VA_ARGS__)
+#endif
 
 class TCUtils
 {

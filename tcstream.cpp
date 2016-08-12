@@ -1,37 +1,54 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <cassert>
+#include <cstring>
 
 #include "tcstream.h"
 #include "tcutils.h"
 
 uint8_t magic[4] = { 0xaa, 0xbb, 0xcc, 0xdd };
 
-#define PACKET_TYPE_DATA 0
-#define PACKET_TYPE_ACK  1
+#define PACKET_TYPE_DATA 1
+#define PACKET_TYPE_SOP  2 // start of packet
+#define PACKET_TYPE_EOP  4 // end of packet
+#define PACKET_TYPE_ACK  8
 
-#ifndef LOG
-#define LOG(x,...)
+#if defined(TCS_LOG_FUNC) && defined(TCSTREAM_DEBUG)
+#define TCLOG(x,...) TCS_LOG_FUNC(x "\r\n", ##__VA_ARGS__)
+#define TCLOG_INFO(x,...) TCS_LOG_FUNC(x, ##__VA_ARGS__)
+#else
+#define TCLOG(x,...)
+#define TCLOG_INFO(x,...)
 #endif
 
-#define ERROR_TIMEOUT      -1
-#define ERROR_NEWSESSION   -2
-#define RESULT_NEWPACKET   -4
-#define RESULT_ENDOFPACKET -5
-
 uint16_t crc16_update(uint16_t crc, const void* data, int len);
+
+void printHeader(const char* intro, const TPacketHeader& header)
+{
+#ifdef TCSTREAM_DEBUG
+	const char *t1 = "", *t2 = "", *t3 = "", *t4 = "";
+	if (header.type & PACKET_TYPE_SOP) t1 = " SOP";
+	if (header.type & PACKET_TYPE_DATA) t2 = " DATA";
+	if (header.type & PACKET_TYPE_EOP) t3 = " EOP";
+	if (header.type & PACKET_TYPE_ACK) t4 = " ACK";
+
+	TCLOG("%s type:%s%s%s%s id: %d byteIdx: %d len: %d crc: 0x%04x", intro,
+	    t1, t2, t3, t4, header.packetId, header.byteIdx, header.length, header.crc);
+#endif
+}
 
 void TCStream::run()
 {
 	int state = 0;
-	uint8_t magicQueue[4];
+	uint8_t magicQueue[4] = {0};
 	uint32_t startTime;
-	uint16_t idx;
-	for (;;)
+	uint16_t idx = 0;
+	doStop = false;
+	while (!doStop)
 	{
 		char inData[10];
-		int rd = stream.read(inData, sizeof(inData), 200);
-		// LOG("new data: %d", rd);
+		int rd = stream.read(inData, sizeof(inData), 70);
+		TCLOG("new data: %d", rd);
 
 		if (rd > 0)
 			recvBytes += rd;
@@ -39,6 +56,7 @@ void TCStream::run()
 		for (int i = 0; i < rd; i++)
 		{
 			uint8_t b = inData[i];
+			// TCLOG("new data (%d): 0x%02x %d", i, b, b);
 
 			magicQueue[0] = magicQueue[1];
 			magicQueue[1] = magicQueue[2];
@@ -60,7 +78,7 @@ void TCStream::run()
 				{
 					state = 1;
 					startTime = TCUtils::getTicks();
-					// LOG("start %d", startTime);
+					TCLOG("magic match start %u", startTime);
 					idx = 0;
 				}
 				break;
@@ -68,17 +86,16 @@ void TCStream::run()
 				headerData[idx++] = b;
 				if (idx == sizeof(recvHeader))
 				{
-					LOG("type: %d len: %d id: %d:%d crc: 0x%04x", recvHeader.type, recvHeader.length,
-					    recvHeader.packetId, recvHeader.byteIdx, recvHeader.crc);
-					if (recvHeader.length == 0)
-					{
-						checkPacket();
-						state = 0;
-					}
-					else
+					TCLOG("got data");
+					if (recvHeader.length > 0)
 					{
 						idx = 0;
 						state = 2;
+					}
+					else
+					{
+						checkPacket();
+						state = 0;
 					}
 				}
 				break;
@@ -86,25 +103,26 @@ void TCStream::run()
 				inPacketData[idx++] = b;
 				if (idx == recvHeader.length)
 				{
-					LOG("got payload");
+					TCLOG("got payload");
 					checkPacket();
 					state = 0;
 				}
 				else if (idx > packetSize)
 				{
-					LOG("too long packet");
+					TCLOG("too long packet");
 					state = 0;
 				}
 				break;
 			}
 		}
 
-		if (state != 0 && TCUtils::getTicks() - startTime >= 20)
+		if (state != 0 && TCUtils::getTicks() - startTime >= 150)
 		{
 			state = 0;
-			LOG("lost packet");
+			TCLOG("lost packet");
 		}
 	}
+	TCLOG("tcstream thread ended");
 }
 
 // receiving
@@ -116,118 +134,166 @@ void TCStream::checkPacket()
 	uint16_t crc = 0;
 	crc = crc16_update(crc, (void*)&recvHeader, sizeof(recvHeader));
 	crc = crc16_update(crc, inPacketData, recvHeader.length);
-	// LOG("calcr: 0x%04x", crc);
+	// TCLOG("calcr: 0x%04x", crc);
 
 	if (origCrc == crc)
 	{
+		printHeader("RECEIVED PACKET", recvHeader);
 		processPacket();
 	}
 	else
 	{
-		LOG("bad crc");
+		TCLOG("bad crc");
 	}
 }
 void TCStream::processPacket()
 {
-	if (recvHeader.type == PACKET_TYPE_DATA)
+	int type = recvHeader.type;
+	bool doSendAck = false;
+
+	if (recvHeader.type == PACKET_TYPE_ACK)
 	{
-		LOG("got packet (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
+		TCLOG("process ACK (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
+		writeMutex.lock();
+		ackedPacketId = recvHeader.packetId;
+		ackedPacketByteIdx = recvHeader.byteIdx;
+		writeMutex.unlock();
+		writeCondVar.notify_one();
+		TCLOG("ack proceed");
+		return;
+	}
+
+	if (type & PACKET_TYPE_SOP)
+	{
+		TCLOG("process SOP (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
+		if (recvHeader.packetId == lastReceivedPacketId)
+		{
+			// prevent putting multiple SOP to the queue, ACK will be sent in DATA processing, as SOP always comes with DATA
+		}
+		else
+		{
+			TCLOG("new packet id");
+			if (recvQueue->put(TQueueItem(1, 0), 10))
+			{
+				lastReceivedPacketId = recvHeader.packetId;
+				lastReceivedPacketByteIdx = 0;
+				lastReceivedByteNum = -1;
+				lastReceivedPacketType = PACKET_TYPE_DATA;
+			}
+			else
+			{
+				droppedStartPacketMakers++;
+				goto end;
+			}
+		}
+	}
+
+	if (type & PACKET_TYPE_DATA)
+	{
+		TCLOG("process DATA (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
 		// printf("got packet (%d:%d)\r\n", recvHeader.packetId, recvHeader.byteIdx);
 
 		if (recvHeader.packetId == lastReceivedPacketId)
 		{
-			// sender didn't receive ACK and retransmitted packet
+			// sender didn't receive ACK and has retransmitted packet
 			if (recvHeader.byteIdx < lastReceivedPacketByteIdx)
 			{
-				LOG("repeated packet, dropping, new packet (%d:%d) last packet (%d:%d)",
+				TCLOG("repeated DATA, dropping, new packet (%d:%d) last packet (%d:%d)",
 				    recvHeader.packetId, recvHeader.byteIdx, lastReceivedPacketId, lastReceivedPacketByteIdx);
 
 				repeatedPackets++;
 
-				sendAck();
-			}
-			// End Of Packet was received (byteIdx = 0xffff)
-			else if (recvHeader.byteIdx == 0xffff)
-			{
-				LOG("whole packet received %d", lastReceivedByteNum);
-
-				if (recvQueue->put(TQueueItem(2, 0), 10))
-				{
-					recvPackets++;
-					lastReceivedPacketByteIdx = recvHeader.byteIdx;
-					sendAck();
-				}
-				else
-				{
-					droppedEndPacketMarkers++;
-				}
-
-				// lastReceivedPacketId = 0;
+				doSendAck = true;
 			}
 			// next packet part was received
 			else
 			{
-				LOG("new packet part");
+				TCLOG("new packet part");
 
 				if (processIncomingBytes())
 				{
 					recvPackets++;
 					lastReceivedPacketByteIdx = recvHeader.byteIdx;
-					sendAck();
+					doSendAck = true;
 				}
 				else
 				{
 					droppedDataPackets++;
+					goto end;
 				}
 			}
 		}
 		// different packet
 		else
 		{
-			// new packet is incoming
-			if (recvHeader.byteIdx == 0)
-			{
-				LOG("new packet id");
-				if (recvQueue->put(TQueueItem(1, 0), 10))
-				{
-					lastReceivedPacketId = recvHeader.packetId;
-					lastReceivedPacketByteIdx = 0;
-					lastReceivedByteNum = -1;
+			// packet with different id was received but SOP was not present, as we cannot do anything interesting
+			// in this situation, so it is simple dropped
+			TCLOG("unknown %d:%d\r\n", recvHeader.packetId, recvHeader.byteIdx);
+		}
+	}
 
-					if (processIncomingBytes())
+	if (type & PACKET_TYPE_EOP)
+	{
+		TCLOG("process EOP (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
+		if (recvHeader.packetId == lastReceivedPacketId)
+		{
+			// sender didn't receive ACK and retransmitted packet
+			if (lastReceivedPacketType == PACKET_TYPE_EOP)
+			{
+				TCLOG("repeated EOP, dropping, new packet (%d:%d) last packet (%d:%d)",
+				    recvHeader.packetId, recvHeader.byteIdx, lastReceivedPacketId, lastReceivedPacketByteIdx);
+
+				repeatedPackets++;
+
+				doSendAck = true;
+			}
+			// End Of Packet was received
+			else
+			{
+				int received = lastReceivedByteNum + 1;
+
+				int toReceive;
+				if (type & PACKET_TYPE_DATA) // DATA + EOP
+					toReceive = recvHeader.byteIdx + recvHeader.length;
+				else // only EOP
+					toReceive = recvHeader.byteIdx; // byteIdx = total payload bytes sent by sender
+
+				TCLOG("whole packet, received %d, to receive %d", received, toReceive);
+
+				if (received == toReceive)
+				{
+					if (recvQueue->put(TQueueItem(2, 0), 10))
 					{
 						recvPackets++;
-						sendAck();
+						lastReceivedPacketByteIdx = recvHeader.byteIdx;
+						lastReceivedPacketType = PACKET_TYPE_EOP;
+						doSendAck = true;
 					}
 					else
 					{
-						droppedDataPackets++;
+						droppedEndPacketMarkers++;
+						goto end;
 					}
 				}
+				// we received EOP but we didn't receive all DATA packets, so all we can do is to ignore whole packet
 				else
 				{
-					droppedStartPacketMakers++;
+					TCLOG("EOP without DATA, ignoring");
 				}
 			}
-			// packet with different id was received but byteIdx is not 0, as we cannot do anything interesting
+		}
+		// different packet
+		else
+		{
+			// packet with different id was received but it is End Of Packet, as we cannot do anything interesting
 			// in this situation, it is simple dropped
-			else
-			{
-				LOG("unknown %d:%d\r\n", recvHeader.packetId, recvHeader.byteIdx);
-				// new packet id with non 0 byteIdx, error, ignore
-			}
+			TCLOG("unknown EOP %d:%d\r\n", recvHeader.packetId, recvHeader.byteIdx);
 		}
 	}
-	else if (recvHeader.type == PACKET_TYPE_ACK)
-	{
-		LOG("got ack (%d:%d)", recvHeader.packetId, recvHeader.byteIdx);
-		writeMutex.lock();
-		ackedPacketId = recvHeader.packetId;
-		ackedPacketByteIdx = recvHeader.byteIdx;
-		writeMutex.unlock();
-		writeCondVar.notify_one();
-		LOG("ack proceed");
-	}
+
+end:
+	if (doSendAck)
+		sendAck();
 }
 bool TCStream::processIncomingBytes()
 {
@@ -253,8 +319,8 @@ bool TCStream::processIncomingBytes()
 			{
 				// printf("asd\r\n");
 				droppedBytes++;
-				LOG("unable to put all in queue, force other side to resend packet");
-				return false; // in order to make other side to resend packet (not all bytes has been placen in queue)
+				TCLOG("unable to put all in queue, force other side to resend packet");
+				return false; // in order to make other side to resend packet (not all bytes has been placed in queue)
 			}
 		}
 	}
@@ -266,7 +332,7 @@ bool TCStream::processIncomingBytes()
 void TCStream::beginPacket()
 {
 	writeTransferMutex.lock();
-	sendHeader.type = 0;
+	sendHeader.type = PACKET_TYPE_SOP;
 	sendHeader.packetId++;
 	sendHeader.length = 0;
 	sendHeader.crc = 0;
@@ -277,11 +343,11 @@ int TCStream::write(const void* data, int length)
 {
 	for (int i = 0; i < length; i++)
 	{
-		outPacketData[outIdx++] = ((uint8_t*)data)[i];
+		outPacketData[PACKET_HEADER_SIZE + outIdx++] = ((uint8_t*)data)[i];
 		if (outIdx == packetSize)
 		{
-			LOG("out buffer full (%d), flushing", outIdx);
-			int res = flushPacket();
+			TCLOG("out buffer full (%d), flushing", outIdx);
+			int res = flushPacket(false);
 			if (res < 0)
 			{
 				writeTransferMutex.unlock();
@@ -290,15 +356,31 @@ int TCStream::write(const void* data, int length)
 		}
 	}
 
-	LOG("part saved to buffer");
+	TCLOG("part saved to buffer");
 	return length;
 }
 int TCStream::endPacket()
 {
 	if (outIdx > 0)
 	{
-		LOG("sending remaining in buffer");
-		int res = flushPacket();
+		TCLOG("sending remaining in buffer %d", outIdx);
+		int res = flushPacket(true);
+		if (res < 0)
+		{
+			writeTransferMutex.unlock();
+			return res;
+		}
+	}
+	else
+	{
+		TCLOG("sending EOP marker");
+		TPacketHeader eopHeader;
+		eopHeader.type = PACKET_TYPE_EOP;
+		eopHeader.packetId = sendHeader.packetId;
+		eopHeader.byteIdx = sendHeader.byteIdx; // bytesIdx = total length
+		eopHeader.crc = 0;
+		eopHeader.length = 0;
+		int res = sendDataPacket(eopHeader);
 		if (res < 0)
 		{
 			writeTransferMutex.unlock();
@@ -306,35 +388,25 @@ int TCStream::endPacket()
 		}
 	}
 
-	LOG("sending EOP marker");
-	TPacketHeader eopHeader;
-	eopHeader.type = 0;
-	eopHeader.packetId = sendHeader.packetId;
-	eopHeader.byteIdx = 0xffff;
-	eopHeader.crc = 0;
-	eopHeader.length = 0;
-	int res = sendPacket(eopHeader, 0, true);
-	if (res < 0)
-	{
-		writeTransferMutex.unlock();
-		return res;
-	}
-
-	LOG("whole packet has been sent successfully");
+	TCLOG("whole packet has been sent successfully");
 
 	writeTransferMutex.unlock();
 	return 0;
 }
-int TCStream::flushPacket()
+int TCStream::flushPacket(bool lastPacket)
 {
-	LOG("flushPacket() len: %d", outIdx);
+	TCLOG("flushPacket() len: %d", outIdx);
 	sendHeader.length = outIdx;
+	sendHeader.type |= PACKET_TYPE_DATA;
+	if (lastPacket)
+		sendHeader.type |= PACKET_TYPE_EOP;
 
-	int res = sendPacket(sendHeader, outPacketData, true);
+	int res = sendDataPacket(sendHeader);
 
 	if (res == 0)
 	{
 		sendHeader.byteIdx += sendHeader.length;
+		sendHeader.type &= ~PACKET_TYPE_SOP;
 		outIdx = 0;
 		return sendHeader.length;
 	}
@@ -343,34 +415,52 @@ int TCStream::flushPacket()
 		return res;
 	}
 }
-int TCStream::sendPacket(TPacketHeader& header, const void* data, bool waitForAck)
+int TCStream::sendPacket(TPacketHeader& header)
 {
 	header.crc = 0;
 	uint16_t crc = crc16_update(0, &header, sizeof(header));
-	crc = crc16_update(crc, data, header.length);
 	header.crc = crc;
 
-	LOG("sending packet type: %d len: %d id %d:%d crc: 0x%04x", header.type, header.length, header.packetId, header.byteIdx, header.crc);
+	uint8_t buffer[PACKET_HEADER_SIZE];
+	memcpy(buffer, magic, sizeof(magic));
+	memcpy(buffer + sizeof(magic), &header, sizeof(header));
+	int res = stream.write(buffer, sizeof(buffer), 100);
+	if (res < 0)
+	{
+		TCLOG("API error %d", res);
+		return ERROR_API;
+	}
+	return 0;
+}
+int TCStream::sendDataPacket(TPacketHeader& header)
+{
+	header.crc = 0;
+	uint16_t crc = crc16_update(0, &header, sizeof(header));
+	crc = crc16_update(crc, outPacketData + PACKET_HEADER_SIZE, header.length);
+	header.crc = crc;
+
+	printHeader("SENDING PACKET", header);
+
+	memcpy(outPacketData, magic, sizeof(magic));
+	memcpy(outPacketData + sizeof(magic), &header, sizeof(header));
 
 	bool sendok = false;
 	uint32_t t = TCUtils::getTicks();
-	while (!sendok && TCUtils::getTicks() - t < 10000)
+	while (!sendok && TCUtils::getTicks() - t < 1000)
 	{
-		stream.write(magic, sizeof(magic), 0);
-		stream.write(&header, sizeof(header), 0);
-		if (header.length > 0)
-			stream.write(data, header.length, 0);
-		sentBytes += sizeof(magic) + sizeof(header) + header.length;
-
-		if (!waitForAck)
-			return 0;
+		int res = stream.write(outPacketData, PACKET_HEADER_SIZE + header.length, 100);
+		if (res < 0)
+		{
+			TCLOG("API error %d", res);
+			return ERROR_API;
+		}
 
 		bool timedout = false;
 
 		writeMutex.lock();
 		while (!timedout && (ackedPacketId != header.packetId || ackedPacketByteIdx != header.byteIdx))
 		{
-			if (!writeCondVar.wait(writeMutex, 100))
+			if (!writeCondVar.wait(writeMutex, 200))
 				timedout = true;
 		}
 		writeMutex.unlock();
@@ -379,7 +469,7 @@ int TCStream::sendPacket(TPacketHeader& header, const void* data, bool waitForAc
 		{
 			// usleep(20000);
 			// usleep(1000000);
-			LOG("resending");
+			TCLOG("resending");
 			retransmissions++;
 		}
 		else
@@ -387,7 +477,7 @@ int TCStream::sendPacket(TPacketHeader& header, const void* data, bool waitForAc
 			sentPayloadBytes += header.length;
 			sentPackets++;
 			// printf("ela %d\r\n", TCUtils::getTicks()-t);
-			LOG("packet has beed ACKed");
+			TCLOG("packet has beed ACKed");
 			return 0;
 		}
 	}
@@ -399,7 +489,9 @@ int TCStream::sendPacket(TPacketHeader& header, const void* data, bool waitForAc
 int TCStream::read(void* data, int length, int timeout)
 {
 	assert(timeout >= 0);
-	LOG("read()");
+	TCLOG("read(%d)", length);
+	if (length <= 0)
+		return 0;
 	readMutex.lock();
 	uint8_t *_data = (uint8_t*)data;
 	for (int i = 0; i < length; i++)
@@ -414,7 +506,7 @@ int TCStream::read(void* data, int length, int timeout)
 			{
 				recvQueue->get(item, 0);
 				_data[i] = item.data;
-				LOG("read(): got byte %d", _data[i]);
+				TCLOG("read(): got byte %d", _data[i]);
 			}
 			else
 			{
@@ -426,21 +518,21 @@ int TCStream::read(void* data, int length, int timeout)
 					if (item.type == 1)
 					{
 						recvQueue->get(item, 0);
-						LOG("read(): return new packet");
+						TCLOG("read(): return new packet");
 						readMutex.unlock();
 						return RESULT_NEWPACKET;
 					}
 					else if (item.type == 2)
 					{
 						recvQueue->get(item, 0);
-						LOG("read(): return packet end");
+						TCLOG("read(): return packet end");
 						readMutex.unlock();
 						return RESULT_ENDOFPACKET;
 					}
 				}
 				else
 				{
-					LOG("EOD");
+					TCLOG("EOD");
 					readMutex.unlock();
 					return i;
 				}
@@ -448,7 +540,7 @@ int TCStream::read(void* data, int length, int timeout)
 		}
 		else
 		{
-			LOG("EOD");
+			TCLOG("EOD");
 			readMutex.unlock();
 			return i;
 		}
@@ -465,21 +557,22 @@ void TCStream::sendAck()
 	packet.byteIdx = lastReceivedPacketByteIdx;
 	packet.length = 0;
 
-	sendPacket(packet, 0, false);
+	TCLOG("send ack");
+	sendPacket(packet);
 }
 
 void TCStream::printStats()
 {
-	LOG_INFO("Receiving:\r\n");
-	LOG_INFO("  packets: %d bytes: %d payload bytes: %d\r\n",
+	TCLOG_INFO("Receiving:\r\n");
+	TCLOG_INFO("  packets: %d bytes: %d payload bytes: %d\r\n",
 	         recvPackets, recvBytes, recvPayloadBytes);
-	LOG_INFO("  dropped: START: %3d DATA: %3d EOP: %3d BYTES: %3d\r\n",
+	TCLOG_INFO("  dropped: START: %3d DATA: %3d EOP: %3d BYTES: %3d\r\n",
 	         droppedStartPacketMakers, droppedDataPackets, droppedEndPacketMarkers, droppedBytes);
-	LOG_INFO("  repeated: %3d\r\n", repeatedPackets);
-	LOG_INFO("Sending:\r\n");
-	LOG_INFO("  packets: %d bytes: %d payload bytes: %d\r\n",
+	TCLOG_INFO("  repeated: %3d\r\n", repeatedPackets);
+	TCLOG_INFO("Sending:\r\n");
+	TCLOG_INFO("  packets: %d bytes: %d payload bytes: %d\r\n",
 	         sentPackets, sentBytes, sentPayloadBytes);
-	LOG_INFO("  retransmissions: %d\r\n  timeouts: %d\r\n", retransmissions, timedoutPackets);
+	TCLOG_INFO("  retransmissions: %d\r\n  timeouts: %d\r\n", retransmissions, timedoutPackets);
 }
 
 uint16_t crc16_update(uint16_t crc, const void* data, int len)

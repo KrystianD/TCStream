@@ -29,6 +29,14 @@ struct TQueueItem
 };
 #pragma pack()
 
+#define PACKET_HEADER_SIZE (4 + sizeof(TPacketHeader))
+
+#define ERROR_TIMEOUT      -1
+#define ERROR_NEWSESSION   -2
+#define ERROR_API          -3
+#define RESULT_NEWPACKET   -4
+#define RESULT_ENDOFPACKET -5
+
 class ITCDeviceStream
 {
 public:
@@ -75,8 +83,8 @@ public:
 	void allocateBuffers(int packetSize)
 	{
 		this->packetSize = packetSize;
-		inPacketData = (uint8_t*)TCUtils::malloc(packetSize);
-		outPacketData = (uint8_t*)TCUtils::malloc(packetSize);
+		inPacketData = (uint8_t*)TCUtils::malloc(packetSize + PACKET_HEADER_SIZE);
+		outPacketData = (uint8_t*)TCUtils::malloc(packetSize + PACKET_HEADER_SIZE);
 	}
 
 	void setBuffers(int packetSize, uint8_t* inPacketData, uint8_t* outPacketData)
@@ -87,6 +95,7 @@ public:
 	}
 
 	void run();
+	void stop() { doStop = true; }
 
 	void beginPacket();
 	int write(const void* data, int length);
@@ -97,9 +106,8 @@ public:
 	void printStats();
 
 private:
-public:
-
 	int packetSize;
+	bool doStop;
 
 	// receiving
 	uint8_t* inPacketData;
@@ -108,6 +116,7 @@ public:
 	uint16_t lastReceivedPacketId;
 	uint16_t lastReceivedPacketByteIdx;
 	int lastReceivedByteNum;
+	uint8_t lastReceivedPacketType;
 
 	void checkPacket();
 	void processPacket();
@@ -121,8 +130,9 @@ public:
 	int outIdx;
 	uint16_t ackedPacketId, ackedPacketByteIdx;
 
-	int flushPacket();
-	int sendPacket(TPacketHeader& header, const void* data, bool waitForAck);
+	int flushPacket(bool lastPacket);
+	int sendPacket(TPacketHeader& header);
+	int sendDataPacket(TPacketHeader& header);
 
 	// stats
 	int sentBytes, sentPayloadBytes, sentPackets;

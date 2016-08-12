@@ -3,14 +3,23 @@
 #include <string.h>
 #include <jni.h>
 #include <iostream>
-#include <thread>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/time.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "../tcstream.h"
+#include "tcutils.h"
 #include "TCStream.h"
+
+#if defined(LOG_FUNC) && defined(TCSTREAM_DEBUG)
+#define LOG(x,...) LOG_FUNC(x "\r\n", ##__VA_ARGS__)
+#define LOG_INFO(x,...) LOG_FUNC(x, ##__VA_ARGS__)
+#else
+#define LOG(x,...)
+#define LOG_INFO(x,...)
+#endif
 
 JavaVM* g_vm;
 jobject g_obj;
@@ -19,39 +28,22 @@ jbyteArray g_array;
 jclass g_clazz;
 uint8_t* g_data;
 
-std::thread runThread;
+pthread_t runThread;
 
 class Serial : public virtual ITCDeviceStream
 {
 public:
+	// always called from native thread so attach only once
 	int read(void* data, int length, int timeout)
 	{
 		JNIEnv *g_env;
 		int getEnvStat = g_vm->GetEnv((void **)&g_env, JNI_VERSION_1_6);
 
-		if (getEnvStat == JNI_EDETACHED)
-		{
-			// std::cout << "GetEnv: not attached" << std::endl;
-			if (g_vm->AttachCurrentThread((void **)&g_env, NULL) != 0)
-			{
-				std::cout << "Failed to attach" << std::endl;
-				return -1;
-			}
-		}
-		else if (getEnvStat == JNI_OK)
-		{
-			//
-		}
-		else if (getEnvStat == JNI_EVERSION)
-		{
-			std::cout << "GetEnv: version not supported" << std::endl;
-			return -1;
-		}
 
 		jobject buffer = g_env->NewDirectByteBuffer(data, length);
 
 		int res = g_env->CallIntMethod(g_obj, g_midRead, buffer, length, timeout);
-		// printf("rr %d\r\n", res);
+		// LOG("rr %d", res);
 
 		g_env->DeleteLocalRef(buffer);
 
@@ -60,8 +52,6 @@ public:
 			g_env->ExceptionDescribe();
 		}
 
-		g_vm->DetachCurrentThread();
-
 		return res;
 	}
 	int write(const void* data, int length, int timeout)
@@ -69,14 +59,21 @@ public:
 		JNIEnv *g_env;
 		int getEnvStat = g_vm->GetEnv((void **)&g_env, JNI_VERSION_1_6);
 
+		bool attached = false;
 		if (getEnvStat == JNI_EDETACHED)
 		{
 			// std::cout << "GetEnv: not attached" << std::endl;
-			if (g_vm->AttachCurrentThread((void **)&g_env, NULL) != 0)
+			// if (g_vm->AttachCurrentThread((void**)&g_env, NULL) != 0)
+#ifdef ANDROID_NDK
+			if (g_vm->AttachCurrentThread(&g_env, NULL) != 0)
+#else
+			if (g_vm->AttachCurrentThread((void**)&g_env, NULL) != 0)
+#endif
 			{
 				std::cout << "Failed to attach" << std::endl;
 				return -1;
 			}
+			attached = true;
 		}
 		else if (getEnvStat == JNI_OK)
 		{
@@ -100,7 +97,8 @@ public:
 			g_env->ExceptionDescribe();
 		}
 
-		g_vm->DetachCurrentThread();
+		if (attached)
+			g_vm->DetachCurrentThread();
 
 		return res;
 	}
@@ -109,7 +107,46 @@ public:
 Serial serial;
 TCStream tcs(serial);
 
-JNIEXPORT void JNICALL Java_TCStream_run(JNIEnv* env, jobject obj)
+void* runThreadFunc(void*)
+{
+	JNIEnv *g_env;
+	int getEnvStat = g_vm->GetEnv((void **)&g_env, JNI_VERSION_1_6);
+
+	bool attached = false;
+	if (getEnvStat == JNI_EDETACHED)
+	{
+		// std::cout << "GetEnv: not attached" << std::endl;
+#ifdef ANDROID_NDK
+		if (g_vm->AttachCurrentThread(&g_env, NULL) != 0)
+#else
+		if (g_vm->AttachCurrentThread((void**)&g_env, NULL) != 0)
+#endif
+		{
+			std::cout << "Failed to attach" << std::endl;
+			return 0;
+		}
+		attached = true;
+	}
+	else if (getEnvStat == JNI_OK)
+	{
+		//
+	}
+	else if (getEnvStat == JNI_EVERSION)
+	{
+		std::cout << "GetEnv: version not supported" << std::endl;
+		return 0;
+	}
+
+	tcs.run();
+
+	LOG("detaching");
+	if (attached)
+		g_vm->DetachCurrentThread();
+	LOG("detached");
+
+	return 0;
+}
+JNIEXPORT void JNICALL Java_utils_TCStream_run(JNIEnv* env, jobject obj, jint packetSize, jint queueSize)
 {
 	env->GetJavaVM(&g_vm);
 	g_obj = env->NewGlobalRef(obj);
@@ -129,36 +166,43 @@ JNIEXPORT void JNICALL Java_TCStream_run(JNIEnv* env, jobject obj)
 	g_midWrite = env->GetMethodID(g_clazz, "onWrite", "(Ljava/nio/ByteBuffer;II)I");
 	if (g_midWrite == NULL)
 	{
+
 		std::cout << "Unable to get method2 ref" << std::endl;
 	}
 
-	tcs.allocateBuffers(50);
-	tcs.allocateQueue(1000);
+	tcs.allocateBuffers(packetSize);
+	tcs.allocateQueue(queueSize);
 
 	srand(time(0));
 
-	runThread = std::thread([]()
-	{
-		tcs.run();
-	});
+	pthread_create(&runThread, NULL, runThreadFunc, 0);
 }
 
-JNIEXPORT void JNICALL Java_TCStream_beginPacket (JNIEnv *, jobject)
+JNIEXPORT void JNICALL Java_utils_TCStream_stop(JNIEnv* env, jobject obj)
+{
+	LOG("tcs.stop()");
+	tcs.stop();
+	LOG("join");
+	pthread_join(runThread, 0);
+	LOG("joined");
+}
+
+JNIEXPORT void JNICALL Java_utils_TCStream_beginPacket(JNIEnv *, jobject)
 {
 	tcs.beginPacket();
 }
-JNIEXPORT jint JNICALL Java_TCStream_write(JNIEnv* env, jobject obj, jobject buffer, jint length)
+JNIEXPORT jint JNICALL Java_utils_TCStream_write(JNIEnv* env, jobject obj, jobject buffer, jint length)
 {
 	void* data = env->GetDirectBufferAddress(buffer);
 	int res = tcs.write(data, length);
 	return res;
 }
-JNIEXPORT void JNICALL Java_TCStream_endPacket (JNIEnv *, jobject)
+JNIEXPORT void JNICALL Java_utils_TCStream_endPacket(JNIEnv *, jobject)
 {
 	tcs.endPacket();
 }
 
-JNIEXPORT jint JNICALL Java_TCStream_read(JNIEnv* env, jobject obj, jobject buffer, jint length, jint timeout)
+JNIEXPORT jint JNICALL Java_utils_TCStream_read(JNIEnv* env, jobject obj, jobject buffer, jint length, jint timeout)
 {
 	void* data = env->GetDirectBufferAddress(buffer);
 	int res = tcs.read(data, length, timeout);
